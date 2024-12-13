@@ -22,7 +22,6 @@ LED2 			EQU P3.1 ;порт 2 светодиода зеленый
 Y1 				EQU P3.4 ;порт для стробирующего сигнала
 Y2 				EQU P1.7 ;порт для сигнала управлющего воздействия
 
-IS_FIRST_WRITE  EQU 20h ; флаг, показывающий, что ни одной записи в ОЗУ еще не было 
 BUFFER_EMPTY 	EQU 20h ; флаг, показывающий, что ни одной записи в ОЗУ еще не было
 	
 ; временные константы: 
@@ -72,6 +71,7 @@ digit_handle:
     ; подготовка к выводу на СДИ: 
     MOV     R1, A                           ; цифра  индикатора 
     CALL    display                         ; вызов процедуры вывода цифр на СДИ 
+	CALL 	generator_handle				; вызов генерации У2
     JMP     end_handle                      ; переход по метке  
 	
 err_handle: 
@@ -119,7 +119,6 @@ init:
 	MOV     Q, #0                  ; по умолчанию равняется 0
 	MOV     tail, #START_BUFF      ; инициализируем указатель на начало буфера 
 	MOV     head, #START_BUFF      ; инициализируем указатель на конец буфера 
-	SETB    IS_FIRST_WRITE         ; указываем, что ни одной записи во внешнее ОЗУ еще не было 
 	SETB    BUFFER_EMPTY	       ; указываем, буффер пуст
 	CALL	set_led_buffer_empty   ; включаем зеленый светодиод
 	 
@@ -129,7 +128,7 @@ init:
 	MOV     IE, #00000111b         ; разрешение прерываний от таймера-счетчика 0, внешних INT0, INT1
 	SETB    IT0                    ; прерывание INT0 по спаду сигнала (1 —> 0), чтобы при зажатой клавише не генерировалось повторное прерывание 
 	 
-	MOV     TMOD, #00000001b       ; настройка таймера-0 и таймера-1 на режимы 16-битного счетчика 
+	MOV     TMOD, #00000001b       ; настройка таймера-0 на режим 16-битного счетчика 
 	
 	SETB    Y1                      ; установка строба Y1 в неактивное состояние 
 	SETB    Y2                      ; установка управляющего сигнала в неактивное состояние
@@ -203,8 +202,8 @@ write_pointer:
     CALL    address_comparison       ; вызов процедуры сравнения адресов 
 	JNZ 	pointer_not_equal_end
 	
-	MOV R1, #high(START_BUFF)
-	MOV R2, #low(START_BUFF) 
+	MOV R1, #high(START_BUFF)		 ;если указатель дошел до конца перемещаем его в начало
+	MOV R2, #low(START_BUFF) 		 ;если указатель дошел до конца перемещаем его в начало
 	
 	pointer_not_equal_end:
 	MOV A, R2
@@ -217,6 +216,7 @@ RET
 
 address_comparison: 
     ; сравнение старших частей 
+	CLR 	C
     MOV     A, R2        ; сохранение значения R2 
     SUBB    A, R4        ; вычитание R4 из R2 с целью поднятия флагов* 
     JNZ     end_equal    ; если R2 - R4!= 0 — переход по метке 
@@ -235,10 +235,9 @@ set_led_buffer_empty:
 	RET 
 
 INT_WRITE_RAM: 
-    JB      IS_FIRST_WRITE, first_write  ; если это первая запись* — переход по метке
+    JB      BUFFER_EMPTY, buffer_was_empty  ; если буфер пуст* — переход по метке
 	
-first_write: 
-    CLR     IS_FIRST_WRITE               ; сброс флага первой записи
+	buffer_was_empty: 
 	CLR 	BUFFER_EMPTY				 ; буфер больше не пуст
 	SETB 	LED2						 ; выключение зеленого светодиода
 write_to_ram: 
@@ -253,26 +252,42 @@ write_to_ram:
 	; запись нового адреса головы		
 	MOV R1,DPL							 ; новая младшая часть адреса
 	MOV A, DPH							 
-	ANL A, #31							 	
+	ANL A, #15							 ; зануляем старшие 4 бита у адреса
 	MOV R2, A 							 ; новая старшая часть адреса
 	MOV R0, #head						 ; адрес головы
 	CALL write_pointer					 ; вызов процедуры записи головы
 	
-compare_with_tail:
-	MOV R3, tail + 1
+compare_with_tail:						 ; сравнение с хвостом
+	MOV R3, tail + 1					 
 	MOV R4, tail
 	CALL address_comparison	
 	
 	JZ head_eqaul_tail
+	CALL 	generator_handle
 	RETI
 head_eqaul_tail:
 	CALL set_led_buffer_full
-	MOV R2, tail
-	MOV R1, tail + 1
+	CLR C
+	MOV A, R3
+    ADD A, 	#2          ; Прибавляем 2 к младшему байту
+	MOV R3, A
+    JC INC_HIGH         ; Если есть перенос (Carry), перейти к старшему байту
+
+    ; Завершаем, если переноса нет
+    JMP NOT_CARRY
+
+INC_HIGH:
+	INC R4
+	
+NOT_CARRY:
+	MOV A, 	R3
+	MOV R1,	A
+	MOV A, 	R4
+	MOV R2, A
 	MOV R0, #tail
 	CALL write_pointer
 	SETB LED1
-
+	CALL 	generator_handle
 RETI
 
 READ_FROM_RAM: 
@@ -287,11 +302,12 @@ READ_FROM_RAM:
     MOVX    A, @DPTR					 ; чтение из буфера
 	MOV 	X2, A						 ; запись числа из буфера в Х2
     INC     DPTR                         ; сдвиг по памяти на одну ячейку вправо для "переключения" 
+	INC     DPTR                         ; сдвиг по памяти на одну ячейку вправо для "переключения" 
 	
 	; запись нового указателя 
 	MOV R1,DPL
 	MOV A, DPH
-	ANL A, #31
+	ANL A, #15
 	MOV R2, A
 	MOV R0, #tail
 	CALL write_pointer
@@ -305,7 +321,8 @@ compare_with_head:
 
 	JNZ     on_generator3
 	SETB 	BUFFER_EMPTY
-	JMP 	on_generator3
+	JMP  	on_generator3
+
 generator_handle: 
 	JB BUFFER_EMPTY, on_generator1
 	
@@ -319,9 +336,7 @@ generator_handle:
 	MOV		A, Q					     ; получение значения введенного с клавиатуры 
 	SUBB	A, #1						 ; вычитание из А 1
 	JZ 		on_generator2				 ; если, переход к созданию Y2 по 2 формуле
-	jmp		READ_FROM_RAM
-	
-	
+	JMP		READ_FROM_RAM
 
 on_generator1:
 	MOV P0,#0
@@ -332,7 +347,7 @@ on_generator2:
 	ADD A, #G
 	ANL A, #127
 	MOV P0, A
-	JMP end_read
+ 
 	
 on_generator3: 
 	MOV A, Q
@@ -345,8 +360,8 @@ on_generator3:
 	ANL A, #31
 	MOV P0,A
 	JMP end_read
-end_read: 
-    CLR     IE1                       
-RETI
+	
+end_read:
+RET
 
 end
